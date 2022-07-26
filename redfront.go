@@ -314,6 +314,9 @@ func (pc *proxyClient) allow(commandName string) bool {
 func (pc *proxyClient) Proxy() error {
 	if pc.acltok == nil {
 		// unauthorized and quit
+		if pc.ws == nil {
+			pc.hwr.WriteHeader(http.StatusUnauthorized)
+		}
 		return pc.writeMessage([]byte("-ERR unauthorized\r\n"))
 	}
 	for {
