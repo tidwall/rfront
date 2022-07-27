@@ -26,7 +26,25 @@ make
 
 A `config.json` file is always required. 
 
-Here are some examples:
+### Configuration properties
+
+- `hosts`: Array of publically accessible https hosts.
+- `port`: Server port. Used for non-TLS http hosting.
+- `cluster.addrs`: Array of Redis server addresses.
+- `cluster.auth`: For authorizing the connection to the Redis servers.
+- `acl.tokens`: Array of tokens for authorizing http clients for the current policy.
+- `acl.access`: Default access for commands sent by http clients.
+  - `allow`: Allow all incoming commands.
+  - `disallow`: Deny all incoming commands.
+- `acl.except`: Array of commands that are exceptions to `acl.access`.
+
+### Automatic updates
+
+Changes to the `acl` and `cluster` properties of the `config.json` file will
+automatically be picked up by the running server, and do not require a server
+restart.
+
+### Configuration Examples
 
 Bind the Redis server at `127.0.0.1:6379` to `http://localhost:8000` and
 allow all commands from all clients, except for the `SHUTDOWN` command. 
@@ -76,7 +94,7 @@ commands `set` and `del`.
 }
 ```
 
-## Examples 
+## HTTP Client Examples 
 
 Let's say you are using the first configuration above.
 
