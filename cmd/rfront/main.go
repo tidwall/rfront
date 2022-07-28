@@ -802,7 +802,12 @@ func (pc *proxyClient) Proxy() error {
 						err = pc.writeMessage(
 							[]byte("-ERR wrong number of arguments\r\n"))
 					} else {
-						pc.token = sargs[1]
+						if sargs[1] != pc.token {
+							pc.token = sargs[1]
+							if pc.acltok != nil {
+								pc.acltok = nil
+							}
+						}
 						err = pc.writeMessage([]byte("+OK\r\n"))
 					}
 				} else if !pc.allow(sargs[0]) {
