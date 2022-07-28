@@ -547,12 +547,14 @@ type proxyClient struct {
 	rc         net.Conn
 	rd         *bufio.Reader
 	token      string
-	conn       net.Conn
+	conn       net.Conn      // for hijacked connection
+	pktin      []byte        // for hijacked connection
+	bufout     *bufio.Writer // for hijacked connection
+	is         InputStream
 	query      url.Values
 	nspace     string
 	acl        *aclMap
 	acltok     *aclToken
-	packet     []byte
 	cluster    *clusterInfo
 	cupdated   uint64
 	namespaces *namespaceMap
@@ -569,6 +571,9 @@ func newProxyClient(
 	if r.Header.Get("Connection") == "Upgrade" {
 		switch r.Header.Get("Upgrade") {
 		case "hijack":
+			if true {
+				return nil, errors.New("hijacked connection not allowed")
+			}
 			conn, err = hijack(w, r)
 			if err != nil {
 				return nil, err
@@ -582,7 +587,6 @@ func newProxyClient(
 			}
 		}
 	}
-
 	pc := &proxyClient{
 		req:        r,
 		hwr:        w,
@@ -592,6 +596,10 @@ func newProxyClient(
 		token:      getAuthToken(r.Header, q),
 		namespaces: namespaces,
 		nspace:     r.URL.Path[1:],
+	}
+	if pc.conn != nil {
+		pc.pktin = make([]byte, 8192)
+		pc.bufout = bufio.NewWriterSize(pc.conn, 8192)
 	}
 	return pc, nil
 }
@@ -635,36 +643,46 @@ func (pc *proxyClient) Close() {
 	}
 }
 
-func (pc *proxyClient) readMessage() error {
-	if pc.ws == nil {
+func (pc *proxyClient) readMessage() (data []byte, err error) {
+	if pc.conn != nil {
+		// Hijacked Connection
+		n, err := pc.conn.Read(pc.pktin)
+		if err != nil {
+			return nil, err
+		}
+		data = pc.pktin[:n]
+		return data, nil
+	}
+
+	if pc.ws != nil {
+		// Websocket
+		_, msg, err := pc.ws.ReadMessage()
+		if err != nil {
+			return nil, err
+		}
+		data = msg
+	} else {
 		// Plain HTTP
 		if pc.eof {
-			return io.EOF
+			return nil, io.EOF
 		}
 		pc.eof = true
 		qcmd := pc.query.Get("cmd")
 		if qcmd != "" {
-			pc.packet = []byte(qcmd)
+			data = []byte(qcmd)
 		} else {
 			var err error
-			pc.packet, err = io.ReadAll(pc.req.Body)
+			data, err = io.ReadAll(pc.req.Body)
 			if err != nil {
-				return err
+				return nil, err
 			}
 		}
-	} else {
-		// Websocket
-		_, msg, err := pc.ws.ReadMessage()
-		if err != nil {
-			return err
-		}
-		pc.packet = append(pc.packet, msg...)
 	}
 	// Append an extra new line onto the tail of the packet to that plain
 	// telnet-like commands can be sent over a websocket connection without
 	// the need for adding the extra line breaks.
-	pc.packet = append(pc.packet, '\r', '\n')
-	return nil
+	data = append(data, '\r', '\n')
+	return data, nil
 }
 
 func appendAutoJSON(dst []byte, resp redcon.RESP) []byte {
@@ -686,12 +704,26 @@ func appendAutoJSON(dst []byte, resp redcon.RESP) []byte {
 }
 
 func (pc *proxyClient) writeMessage(msg []byte) error {
-	if pc.ws == nil {
-		_, err := pc.hwr.Write(msg)
+	if pc.conn != nil {
+		// hijacked connection
+		_, err := pc.bufout.Write(msg)
 		return err
-	} else {
+	}
+	if pc.ws != nil {
+		// websocket
 		return pc.ws.WriteMessage(2, msg)
 	}
+	// plain HTTP request
+	_, err := pc.hwr.Write(msg)
+	return err
+}
+
+func (pc *proxyClient) flushWrite() error {
+	if pc.conn != nil {
+		// hijacked connection
+		return pc.bufout.Flush()
+	}
+	return nil
 }
 
 func (pc *proxyClient) allow(commandName string) bool {
@@ -718,15 +750,44 @@ func (pc *proxyClient) allow(commandName string) bool {
 	return true
 }
 
+// InputStream is a helper type for managing input streams from inside
+// the Data event.
+type InputStream struct{ b []byte }
+
+// Begin accepts a new packet and returns a working sequence of
+// unprocessed bytes.
+func (is *InputStream) Begin(packet []byte) (data []byte) {
+	data = packet
+	if len(is.b) > 0 {
+		is.b = append(is.b, data...)
+		data = is.b
+	}
+	return data
+}
+
+// End shifts the stream to match the unprocessed data.
+func (is *InputStream) End(data []byte) {
+	if len(data) > 0 {
+		if len(data) != len(is.b) {
+			is.b = append(is.b[:0], data...)
+		}
+	} else if len(is.b) > 0 {
+		is.b = is.b[:0]
+	}
+}
+
 func (pc *proxyClient) Proxy() error {
 	for {
-		if err := pc.readMessage(); err != nil {
+		in, err := pc.readMessage()
+		if err != nil {
 			// network level error
 			return err
 		}
+		data := pc.is.Begin(in)
+		var complete bool
+		var args [][]byte
 		for {
-			complete, args, _, leftover, err :=
-				redcon.ReadNextCommand(pc.packet, nil)
+			complete, args, _, data, err = redcon.ReadNextCommand(data, args[:0])
 			if err != nil {
 				return err
 			}
@@ -739,7 +800,6 @@ func (pc *proxyClient) Proxy() error {
 					sargs[i] = string(arg)
 				}
 				sargs[0] = strings.ToLower(sargs[0])
-
 				if sargs[0] == "auth" {
 					if len(sargs) != 2 {
 						err = pc.writeMessage(
@@ -757,10 +817,13 @@ func (pc *proxyClient) Proxy() error {
 					return err
 				}
 			}
-			for len(leftover) >= 2 && string(leftover[:2]) == "\r\n" {
-				leftover = leftover[2:]
+			for len(data) >= 2 && string(data[:2]) == "\r\n" {
+				data = data[2:]
 			}
-			pc.packet = append(pc.packet[:0], leftover...)
+		}
+		pc.is.End(data)
+		if err := pc.flushWrite(); err != nil {
+			return err
 		}
 	}
 }
