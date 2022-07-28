@@ -91,8 +91,6 @@ commands `set` and `del`.
 ```
 
 
-
-
 ## HTTP Client Examples 
 
 Let's say you are using the first configuration above.
@@ -130,7 +128,7 @@ $5
 world
 ```
 
-Finally if you require an ACL client token, as in the last configuration above, 
+If you require an ACL client token, as in the last configuration above, 
 you can use the `token` querystring key such as:
 
 
@@ -141,6 +139,26 @@ $ curl 'https://example.com?token=reader-client-token'
 
 Or, you can provide the HTTP header `Authorization: Token reader-client-token`
 
+## RESP Commands
+
+For simple HTTP request, a basic command can sent using `cmd=name+arg+arg` in
+the querystring, like:
+
+```
+$ curl 'http://localhost:8000?cmd=set+hello+world'
+```
+
+Or, you can send the raw RESP in the body of the request, like:
+
+```
+*3
+$3
+set
+$5
+hello
+$5
+world
+```
 
 ## Namespaces
 
