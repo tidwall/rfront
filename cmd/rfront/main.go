@@ -519,7 +519,7 @@ func (s *serverHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func hijack(w http.ResponseWriter, r *http.Request) (net.Conn, error) {
+func hijackRaw(w http.ResponseWriter, r *http.Request) (net.Conn, error) {
 	h, ok := w.(http.Hijacker)
 	if !ok {
 		return nil, errors.New("response cannot be hijacked")
@@ -547,9 +547,9 @@ type proxyClient struct {
 	rc         net.Conn
 	rd         *bufio.Reader
 	token      string
-	conn       net.Conn      // for hijacked connection
-	pktin      []byte        // for hijacked connection
-	bufout     *bufio.Writer // for hijacked connection
+	conn       net.Conn      // for raw hijacked connection
+	pktin      []byte        // for raw hijacked connection
+	bufout     *bufio.Writer // for raw hijacked connection
 	is         InputStream
 	query      url.Values
 	nspace     string
@@ -570,11 +570,8 @@ func newProxyClient(
 	var err error
 	if r.Header.Get("Connection") == "Upgrade" {
 		switch r.Header.Get("Upgrade") {
-		case "hijack":
-			if true {
-				return nil, errors.New("hijacked connection not allowed")
-			}
-			conn, err = hijack(w, r)
+		case "raw":
+			conn, err = hijackRaw(w, r)
 			if err != nil {
 				return nil, err
 			}
