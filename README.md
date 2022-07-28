@@ -10,15 +10,10 @@ An HTTP frontend for Redis-compatible services.
 - Returns the raw RESP outputs
 - Works with Redis-compatible services like Tile38, Redcon, KeyDB, Uhaha, etc.
 
-## Build
+## Build and Run
 
 ```sh
 make
-```
-
-## Use
-
-```
 ./rfront --config config.json
 ```
 
