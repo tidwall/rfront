@@ -32,6 +32,7 @@ A `config.json` file is always required.
   - `allow`: Allow all incoming commands.
   - `disallow`: Deny all incoming commands.
 - `acl.except`: Array of commands that are exceptions to `acl.access`.
+- `namespaces`: Array of cluster and acl groups. See [namespaces](#namespaces).
 
 ### Automatic updates
 
@@ -89,6 +90,9 @@ commands `set` and `del`.
 }
 ```
 
+
+
+
 ## HTTP Client Examples 
 
 Let's say you are using the first configuration above.
@@ -137,4 +141,50 @@ $ curl 'https://example.com?token=reader-client-token'
 
 Or, you can provide the HTTP header `Authorization: Token reader-client-token`
 
+
+## Namespaces
+
+You can configure the server to point to multiple clusters and acl groups
+using namespaces.
+
+```json
+{
+    "hosts": [ "example.com" ],
+    "namespaces": {
+        "redis": {
+            "cluster": {
+                "addrs": [ "10.0.0.1:6379" ],
+                "auth": "my-redis-auth"
+            },
+            "acl": [
+                {
+                    "tokens": [ "reader-client-token" ],
+                    "access": "disallow",
+                    "except": [ "ping", "set", "del", "get" ]
+                }
+            ]
+        },
+        "tile38": {
+            "cluster": {
+                "addrs": [ "10.0.0.1:9851" ],
+                "auth": "my-tile38-auth"
+            },
+            "acl": [
+                {
+                    "tokens": [ "reader-client-token" ],
+                    "access": "disallow",
+                    "except": [ "ping", "set", "del", "intersects" ]
+                }
+            ]
+        },
+    }
+}
+```
+
+Then the client URL would include the namespace like:
+
+```
+https://example.com/tile38?
+https://example.com/redis?
+```
 

@@ -28,23 +28,32 @@ import (
 
 	"github.com/fsnotify/fsnotify"
 	"github.com/gorilla/websocket"
+	"github.com/tidwall/gjson"
 	"github.com/tidwall/jsonc"
 	"github.com/tidwall/redcon"
 	"golang.org/x/crypto/acme/autocert"
 )
 
+type configCluster struct {
+	Addrs []string `json:"addrs"`
+	Auth  string   `json:"auth"`
+}
+
+type configACL struct {
+	Tokens []string `json:"tokens"`
+	Access string   `json:"access"`
+	Except []string `json:"except"`
+}
+
+type configNamespace struct {
+	Cluster configCluster `json:"cluster"`
+	ACL     []configACL   `json:"acl"`
+}
+
 type config struct {
-	Port    int      `json:"port"`
-	Hosts   []string `json:"hosts"`
-	Cluster struct {
-		Addrs []string `json:"addrs"`
-		Auth  string   `json:"auth"`
-	} `json:"cluster"`
-	ACL []struct {
-		Tokens []string `json:"tokens"`
-		Access string   `json:"access"`
-		Except []string `json:"except"`
-	} `json:"acl"`
+	Port       int                        `json:"port"`
+	Hosts      []string                   `json:"hosts"`
+	Namespaces map[string]configNamespace `json:"namespaces"`
 }
 
 func jsonEquals(a, b interface{}) bool {
@@ -59,6 +68,68 @@ func jsonEquals(a, b interface{}) bool {
 	return bytes.Equal(data1, data2)
 }
 
+type namespaceInfo struct {
+	mu      sync.RWMutex
+	cluster *clusterInfo
+	acl     *aclMap
+}
+
+type namespaceMap struct {
+	mu         sync.RWMutex
+	namespaces map[string]*namespaceInfo
+}
+
+func (nmap *namespaceMap) get(nspace string) (*clusterInfo, *aclMap, bool) {
+	nmap.mu.RLock()
+	defer nmap.mu.RUnlock()
+	ninfo, ok := nmap.namespaces[nspace]
+	if !ok {
+		return nil, nil, false
+	}
+	return ninfo.cluster, ninfo.acl, true
+}
+
+func (nmap *namespaceMap) set(nspace string,
+	cluster *clusterInfo, acl *aclMap,
+) bool {
+	nmap.mu.Lock()
+	defer nmap.mu.Unlock()
+	ninfo, ok := nmap.namespaces[nspace]
+	if !ok {
+		ninfo = &namespaceInfo{}
+		nmap.namespaces[nspace] = ninfo
+	}
+	ninfo.cluster = cluster
+	ninfo.acl = acl
+	return ok
+}
+
+func (nmap *namespaceMap) delete(names ...string) {
+	var infos []*namespaceInfo
+
+	// delete namespaces so new connections cannot use.
+	nmap.mu.Lock()
+	for _, name := range names {
+		ninfo, ok := nmap.namespaces[name]
+		if ok {
+			infos = append(infos, ninfo)
+			delete(nmap.namespaces, name)
+		}
+	}
+	nmap.mu.Unlock()
+
+	// invalid old namespace info so existing connections stop using.
+	for _, ninfo := range infos {
+
+		for _, acltok := range ninfo.acl.tokens {
+			acltok.invalidate()
+		}
+		ninfo.cluster.mu.Lock()
+		ninfo.cluster.updated++
+		ninfo.cluster.mu.Unlock()
+	}
+}
+
 type clusterInfo struct {
 	mu      sync.RWMutex
 	updated uint64
@@ -67,11 +138,11 @@ type clusterInfo struct {
 	parent  *clusterInfo
 }
 
-func (cluster *clusterInfo) update(cfg *config) error {
+func (cluster *clusterInfo) update(cfg *configCluster) error {
 	cluster.mu.Lock()
 	cluster.updated++
-	cluster.addrs = append([]string{}, cfg.Cluster.Addrs...)
-	cluster.auth = cfg.Cluster.Auth
+	cluster.addrs = append([]string{}, cfg.Addrs...)
+	cluster.auth = cfg.Auth
 	cluster.mu.Unlock()
 	return nil
 }
@@ -124,9 +195,9 @@ func (acl *aclMap) auth(token string) *aclToken {
 	return acl.tokens[token]
 }
 
-func (acl *aclMap) update(cfg *config) error {
+func (acl *aclMap) update(cfg *[]configACL) error {
 	tokens := make(map[string]*aclToken)
-	for i, acl := range cfg.ACL {
+	for i, acl := range *cfg {
 		var allow bool
 		switch acl.Access {
 		case "allow":
@@ -135,9 +206,9 @@ func (acl *aclMap) update(cfg *config) error {
 			allow = false
 		default:
 			if acl.Access == "" {
-				return fmt.Errorf("%d: missing kind\n", i)
+				return fmt.Errorf("acl %d: missing kind\n", i)
 			}
-			return fmt.Errorf("%d: invalid kind: %s\n", i, acl.Access)
+			return fmt.Errorf("acl %d: invalid kind: %s\n", i, acl.Access)
 		}
 		acltok := aclToken{
 			allow:  allow,
@@ -163,61 +234,175 @@ func (acl *aclMap) update(cfg *config) error {
 	return nil
 }
 
-func readConfig(path string) (config, error) {
-	var cfg config
+func readConfig(path string) (cfg config, err error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return cfg, err
 	}
-	if err := json.Unmarshal(jsonc.ToJSONInPlace(data), &cfg); err != nil {
+	data = jsonc.ToJSONInPlace(data)
+	if err := json.Unmarshal(data, &cfg); err != nil {
 		return cfg, err
+	}
+	// Load root-level namespace
+	var defnspace configNamespace
+	vcluster := gjson.GetBytes(data, "cluster")
+	vacl := gjson.GetBytes(data, "acl")
+	if vcluster.Exists() || vacl.Exists() {
+		if _, ok := cfg.Namespaces[""]; ok {
+			return cfg, errors.New("Ambiguous default namespace. " +
+				"Cannot have both root-level 'cluster' and 'acl' fields and " +
+				"a default namespace at the same time.")
+		}
+		if err := json.Unmarshal(data, &defnspace); err != nil {
+			return cfg, err
+		}
+		if cfg.Namespaces == nil {
+			cfg.Namespaces = make(map[string]configNamespace)
+		}
+		cfg.Namespaces[""] = defnspace
 	}
 	return cfg, nil
 }
 
-func followChanges(path string, cfg config, acl *aclMap, cluster *clusterInfo) {
+// loadConfigAndFollowChanges loads the configuration file and continues to
+// monitor and updates the systems when changes happen.
+func loadConfigAndFollowChanges(path string, namespace *namespaceMap) (
+	config, error,
+) {
+	var ferr error
+	var fcfg config
 	w, err := fsnotify.NewWatcher()
 	if err != nil {
-		log.Fatal(err)
+		return fcfg, err
 	}
+	var wg sync.WaitGroup
+	wg.Add(2)
 	go func() {
-		for e := range w.Events {
-			if e.Op != fsnotify.Write {
-				continue
+		ferr = w.Add(filepath.Dir(path))
+		wg.Done()
+		if ferr != nil {
+			wg.Done()
+			return
+		}
+
+		var once bool   // for first run detection
+		var lcfg config // last known config
+
+		for {
+			if once {
+				for {
+					e := <-w.Events
+					if e.Op == fsnotify.Write {
+						break
+					}
+				}
 			}
 			// An event changed in the
 			cfg2, err := readConfig(path)
 			if err != nil {
-				log.Printf("%s", err)
+				if !once {
+					ferr = err
+					wg.Done()
+					return
+				} else {
+					log.Printf("%s", err)
+				}
 				continue
 			}
-			if !jsonEquals(cfg2, cfg) {
-				// configuration has changed.
-				if !jsonEquals(cfg2.ACL, cfg.ACL) {
-					if err := acl.update(&cfg2); err != nil {
-						log.Printf("acl: %s", err)
-					} else {
-						log.Printf("acl: updated")
+
+			if !once || !jsonEquals(cfg2, lcfg) {
+				// A change to the configurate has occurred.
+				if !once || !jsonEquals(cfg2.Hosts, lcfg.Hosts) ||
+					!jsonEquals(cfg2.Port, lcfg.Port) {
+					// cannot dyanically update Hosts or Port
+					if once {
+						log.Printf(
+							"server: updated (requires restarting program)")
 					}
 				}
-				if !jsonEquals(cfg2.Cluster, cfg.Cluster) {
-					if err := cluster.update(&cfg2); err != nil {
-						log.Printf("cluster: %s", err)
-					} else {
-						log.Printf("cluster: updated")
+				// Update all new/existing namespaces
+				for name, ncfg := range cfg2.Namespaces {
+					lncfg, lnok := lcfg.Namespaces[name]
+					cluster, acl, exists := namespace.get(name)
+					if cluster == nil {
+						cluster = new(clusterInfo)
+					}
+					if acl == nil {
+						acl = new(aclMap)
+					}
+					var clusterUpdated bool
+					var aclUpdated bool
+					err := func() error {
+						var err error
+						if !once || !jsonEquals(ncfg.Cluster, lncfg.Cluster) {
+							err = cluster.update(&ncfg.Cluster)
+							if err != nil {
+								return err
+							}
+							clusterUpdated = true
+						}
+						if !once || !jsonEquals(ncfg.ACL, lncfg.ACL) {
+							err = acl.update(&ncfg.ACL)
+							if err != nil {
+								return err
+							}
+							aclUpdated = true
+						}
+						return nil
+					}()
+					if err != nil {
+						err = fmt.Errorf("namespace '%s': %s", name, err)
+						if !once {
+							ferr = err
+							wg.Done()
+							return
+						} else {
+							log.Printf("%s", err)
+						}
+					}
+					if !exists {
+						namespace.set(name, cluster, acl)
+					}
+					if once {
+						if !lnok {
+							log.Printf("namespace '%s': added", name)
+						} else {
+							if clusterUpdated {
+								log.Printf("namespace '%s': cluster updated",
+									name)
+							}
+							if aclUpdated {
+								log.Printf("namespace '%s': acl updated", name)
+							}
+						}
 					}
 				}
-				if !jsonEquals(cfg2.Hosts, cfg.Hosts) ||
-					!jsonEquals(cfg2.Port, cfg.Port) {
-					log.Printf("server: updated (requires restarting program)")
+
+				// delete removed namespaces
+				var deletedNames []string
+				for name := range lcfg.Namespaces {
+					_, ok := cfg2.Namespaces[name]
+					if !ok {
+						deletedNames = append(deletedNames, name)
+					}
 				}
-				cfg = cfg2
+				namespace.delete(deletedNames...)
+				for _, name := range deletedNames {
+					log.Printf("namespace '%s': deleted", name)
+				}
+
+				lcfg = cfg2
+			}
+			if !once {
+				once = true
+				fcfg = lcfg
+				wg.Done()
 			}
 		}
 	}()
-	if err := w.Add(filepath.Dir(path)); err != nil {
-		log.Fatal(err)
-	}
+
+	wg.Wait()
+	return fcfg, ferr
 }
 
 func main() {
@@ -226,24 +411,16 @@ func main() {
 	flag.Parse()
 
 	log.SetFlags(0)
-	cfg, err := readConfig(path)
+	namespaces := &namespaceMap{
+		namespaces: make(map[string]*namespaceInfo),
+	}
+	cfg, err := loadConfigAndFollowChanges(path, namespaces)
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	var cluster clusterInfo
-	if err := cluster.update(&cfg); err != nil {
-		log.Fatal(err)
-	}
-
-	var acl aclMap
-	if err := acl.update(&cfg); err != nil {
-		log.Fatal(err)
-	}
-
 	handler := &serverHandler{
-		acl:     &acl,
-		cluster: &cluster,
+		namespaces: namespaces,
 	}
 
 	makeServer := func(addr string) *http.Server {
@@ -255,8 +432,6 @@ func main() {
 			Addr:         addr,
 		}
 	}
-
-	followChanges(path, cfg, &acl, &cluster)
 
 	var s1 *http.Server
 	var s2 *http.Server
@@ -325,12 +500,11 @@ func isLeadershipError(emsg string) bool {
 var upgrader = websocket.Upgrader{} // use default options
 
 type serverHandler struct {
-	acl     *aclMap
-	cluster *clusterInfo
+	namespaces *namespaceMap
 }
 
 func (s *serverHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	pc, err := newProxyClient(w, r, s.acl, s.cluster)
+	pc, err := newProxyClient(w, r, s.namespaces)
 	if err != nil {
 		log.Print("upgrade:", err)
 		return
@@ -366,25 +540,27 @@ func hijack(w http.ResponseWriter, r *http.Request) (net.Conn, error) {
 }
 
 type proxyClient struct {
-	req      *http.Request
-	eof      bool
-	hwr      http.ResponseWriter
-	ws       *websocket.Conn
-	rc       net.Conn
-	rd       *bufio.Reader
-	token    string
-	conn     net.Conn
-	query    url.Values
-	acl      *aclMap
-	acltok   *aclToken
-	packet   []byte
-	cluster  *clusterInfo
-	cupdated uint64
+	req        *http.Request
+	eof        bool
+	hwr        http.ResponseWriter
+	ws         *websocket.Conn
+	rc         net.Conn
+	rd         *bufio.Reader
+	token      string
+	conn       net.Conn
+	query      url.Values
+	nspace     string
+	acl        *aclMap
+	acltok     *aclToken
+	packet     []byte
+	cluster    *clusterInfo
+	cupdated   uint64
+	namespaces *namespaceMap
 }
 
 func newProxyClient(
 	w http.ResponseWriter, r *http.Request,
-	acl *aclMap, cluster *clusterInfo,
+	namespaces *namespaceMap,
 ) (*proxyClient, error) {
 	q := r.URL.Query()
 	var ws *websocket.Conn
@@ -406,15 +582,16 @@ func newProxyClient(
 			}
 		}
 	}
+
 	pc := &proxyClient{
-		req:     r,
-		hwr:     w,
-		ws:      ws,
-		query:   q,
-		conn:    conn,
-		acl:     acl,
-		token:   getAuthToken(r.Header, q),
-		cluster: cluster.copy(),
+		req:        r,
+		hwr:        w,
+		ws:         ws,
+		query:      q,
+		conn:       conn,
+		token:      getAuthToken(r.Header, q),
+		namespaces: namespaces,
+		nspace:     r.URL.Path[1:],
 	}
 	return pc, nil
 }
@@ -519,6 +696,11 @@ func (pc *proxyClient) writeMessage(msg []byte) error {
 
 func (pc *proxyClient) allow(commandName string) bool {
 	if pc.acltok == nil || !pc.acltok.valid() {
+		pc.acltok = nil
+		_, pc.acl, _ = pc.namespaces.get(pc.nspace)
+		if pc.acl == nil {
+			return false
+		}
 		pc.acltok = pc.acl.auth(pc.token)
 		if pc.acltok == nil {
 			return false
@@ -599,16 +781,20 @@ func (pc *proxyClient) execCommand(args []string) error {
 	writeTimeout := time.Second * 5
 	start := time.Now()
 	for time.Since(start) < writeTimeout {
-
-		if !pc.cluster.valid() {
-			// The share cluster has been updated.
+		if pc.cluster == nil || !pc.cluster.valid() {
+			// The namespace cluster has been updated.
 			// Close the client connection to the redis server and clone the
 			// the updated cluster.
+			pc.cluster = nil
 			if pc.rc != nil {
 				pc.rc.Close()
 				pc.rc = nil
 			}
-			pc.cluster = pc.cluster.parent.copy()
+			pc.cluster, _, _ = pc.namespaces.get(pc.nspace)
+			if pc.cluster == nil {
+				return pc.writeMessage([]byte("-ERR unauthorized\r\n"))
+			}
+			pc.cluster = pc.cluster.copy()
 		}
 
 		if pc.rc == nil {
@@ -626,8 +812,7 @@ func (pc *proxyClient) execCommand(args []string) error {
 					}
 				}
 				if pc.rc == nil && err == nil {
-					pc.writeMessage([]byte("-ERR no servers available\r\n"))
-					return errors.New("no servers available")
+					return pc.writeMessage([]byte("-ERR unauthorized\r\n"))
 				}
 			}
 			if err != nil {
