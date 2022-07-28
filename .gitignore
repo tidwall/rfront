@@ -1,3 +1,4 @@
-redfront
-!redfront/
+rfront
+!rfront/
 config.json
+deploy.sh

@@ -1,5 +1,5 @@
-all: redfront
+all: rfront
 
-.PHONY: redfront
-redfront:
-	go build -o redfront cmd/redfront/*.go
+.PHONY: rfront
+rfront:
+	go build -o rfront cmd/rfront/*.go

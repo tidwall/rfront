@@ -1,4 +1,4 @@
-# redfront
+# rfront
 
 An HTTP frontend for Redis-compatible services.
 
@@ -19,7 +19,7 @@ make
 ## Use
 
 ```
-./redfront --config config.json
+./rfront --config config.json
 ```
 
 ## Configure

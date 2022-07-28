@@ -1,4 +1,4 @@
-module github.com/tidwall/redfront
+module github.com/tidwall/rfront
 
 go 1.18
 
