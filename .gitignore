@@ -1,4 +1,5 @@
 rfront
 !rfront/
 config.json
+config.jsonc
 deploy.sh
